@@ -1,0 +1,108 @@
+name: Build, Analyze, Push
+
+on:
+  push:
+    tags: ["*"]
+    branches:
+      - main
+  pull_request:
+    branches: ["**"]
+
+env:
+  REGISTRY: docker.io
+  REGISTRY_USER: felipecruz
+  IMAGE_NAME: felipecruz/${{ github.event.repository.name }}
+  SHA: ${{ github.event.pull_request.head.sha || github.event.after }}
+
+jobs:
+  build-analyze-push:
+    name: Build, Analyze, Push
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # for actions/checkout to fetch code
+      packages: write
+      pull-requests: write # needed to create and update comments in PRs
+
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta
+        id: docker_meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.SHA }}
+          tags: |
+            type=edge
+            type=semver,pattern={{version}}
+            type=sha,prefix=,suffix=,format=short
+
+      - name: Build and export to Docker
+        uses: docker/build-push-action@v4
+        with:
+          push: false
+          load: true # Export to Docker Engine rather than pushing to a registry
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Docker Scout CVEs
+        uses: docker/scout-action@v0.18.1
+        with:
+          command: cves
+          image: "" # If image is not set (or empty) the most recently built image, if any, will be used instead.
+          only-fixed: true # Filter to fixable CVEs only
+          # ignore-unchanged: true # Filter out unchanged packages
+          only-severities: critical,high
+          write-comment: true
+          github-token: ${{ secrets.GITHUB_TOKEN }} # to be able to write the comment
+          exit-code: true # Fail the build if there are CVEs
+
+      - name: Multi-platform Docker Build and Push to registry
+        id: build-and-push
+        uses: docker/build-push-action@v4
+        with:
+          push: ${{ github.event_name != 'pull_request' }}
+          load: false # docker exporter does not currently support exporting manifest lists
+          sbom: true
+          provenance: true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Check if ":edge" tag exists
+        if: github.event_name == 'pull_request'
+        id: check
+        continue-on-error: true
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:edge
+
+      - name: Docker Scout Compare image against ":edge" tag
+        if: always() && steps.check.outcome == 'success' && github.event_name == 'pull_request'
+        uses: docker/scout-action@v0.18.1
+        with:
+          command: compare
+          image: ${{ steps.meta.outputs.tags }}
+          to: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:edge
+          only-fixed: true # Filter to fixable CVEs only
+          ignore-unchanged: true # Filter out unchanged packages
+          only-severities: critical,high
+          write-comment: true
+          github-token: ${{ secrets.GITHUB_TOKEN }} # to be able to write the comment
+          exit-code: true # Fail the build if vulnerability changes are detected
